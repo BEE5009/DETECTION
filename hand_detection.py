@@ -1,0 +1,970 @@
+import argparse
+import time
+import tempfile
+import urllib.request
+import os
+import sys
+from typing import Optional
+import pickle
+import numpy as np
+
+try:
+    import cv2
+except ImportError as exc:
+    raise ImportError(
+        "OpenCV is not installed. Run: python -m pip install opencv-python"
+    ) from exc
+
+_SELECTED_THAI_FONT_PATH: Optional[str] = None
+
+MODEL_PATH = 'model.p'
+_gesture_model = None
+_gesture_label_map = None
+
+# ภาษา UI: 'TH' หรือ 'EN'
+UI_LANGUAGE = 'TH'
+
+UI_TEXT = {
+    'TH': {
+        'help': 'กด A เพื่อสลับภาษา TH/EN | Q=ออก | B=เซฟท่า | C=ล้างท่า | R=บันทึก | E=ลบ | T=จบ',
+        'lang_name': 'ไทย',
+        'saved': "บันทึกท่า 'ลับ' เรียบร้อยแล้ว",
+        'saved_fail': 'ไม่สามารถบันทึกท่าได้',
+        'no_hand': 'ยังไม่พบมือ (วางมือไว้ในกล้องก่อนบันทึก)',
+        'reset_template': "ล้างท่า 'ลับ' เรียบร้อยแล้ว",
+        'recorded': 'บันทึก',
+        'removed': 'ลบ',
+        'result': 'ผลลัพธ์',
+        'template_status': 'ท่า คงที่',
+    },
+    'EN': {
+        'help': 'Press A to toggle language TH/EN | Q=quit | B=save template | C=clear | R=record | E=erase | T=finish',
+        'lang_name': 'English',
+        'saved': "Saved template",
+        'saved_fail': 'Failed to save template',
+        'no_hand': 'No hand detected (place hand in camera first)',
+        'reset_template': 'Template cleared',
+        'recorded': 'Recorded',
+        'removed': 'Removed',
+        'result': 'Result',
+        'template_status': 'Template status',
+    }
+}
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
+
+def get_ui_text(key):
+    return UI_TEXT.get(UI_LANGUAGE, UI_TEXT['TH']).get(key, '')
+
+
+def toggle_language():
+    global UI_LANGUAGE
+    UI_LANGUAGE = 'EN' if UI_LANGUAGE == 'TH' else 'TH'
+    update_active_alphabet()
+    print(f"[Lang] เปลี่ยนภาษาเป็น {UI_TEXT[UI_LANGUAGE]['lang_name']}")
+    print(f"[Gesture] เปลี่ยนอักษรใช้งานเป็น {len(ACTIVE_ALPHABET)} ตัว ({'ก-ฮ' if UI_LANGUAGE=='TH' else 'A-Z'})")
+
+
+def _draw_unicode_text(img, text, position, font_size=32, color=(0, 255, 0)):
+    """Draw Unicode text (e.g., Thai) onto an OpenCV image.
+
+    Falls back to cv2.putText when Pillow is not available.
+    """
+
+    if not _PIL_AVAILABLE:
+        cv2.putText(img, text, position, cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        return
+
+    from numpy import array
+
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+
+    def _find_thai_font_path():
+        """Find a font file that supports Thai text (prefers Sarabun)."""
+       
+        filename_candidates = [
+            "Sarabun-Regular.ttf",
+            "TH Sarabun New.ttf",
+            "THSarabun.ttf",
+            "THSarabunNew.ttf",
+            "THSarabun Bold.ttf",
+            "THSarabunNew Bold.ttf",
+            "Leelawadee UI.ttf",
+            "NotoSansThai-Regular.ttf",
+            "Tahoma.ttf",
+        ]
+
+       
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        local_font_dirs = [script_dir, os.getcwd(), os.path.join(script_dir, "ฟอนต์")]
+
+        for base in local_font_dirs:
+           
+            for name in filename_candidates:
+                path = os.path.join(base, name)
+                if os.path.exists(path):
+                    return path
+
+            if os.path.isdir(base):
+                for root, _, files in os.walk(base):
+                    for file in files:
+                        if file.lower().endswith(".ttf") and "sarabun" in file.lower():
+                            return os.path.join(root, file)
+
+        system_font_dirs = []
+        if os.name == "nt":
+            system_font_dirs.append(os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts"))
+        else:
+            system_font_dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts", "/Library/Fonts"])
+
+        for base in system_font_dirs:
+            for name in filename_candidates:
+                path = os.path.join(base, name)
+                if os.path.exists(path):
+                    return path
+            if os.path.isdir(base):
+                for root, _, files in os.walk(base):
+                    for file in files:
+                        if file.lower().endswith(".ttf") and "sarabun" in file.lower():
+                            return os.path.join(root, file)
+
+        for name in ["Leelawadee UI.ttf", "Tahoma.ttf", "NotoSansThai-Regular.ttf"]:
+            try:
+                ImageFont.truetype(name, font_size)
+                return name
+            except Exception:
+                pass
+
+        return None
+
+    global _SELECTED_THAI_FONT_PATH
+    if _SELECTED_THAI_FONT_PATH is None:
+        _SELECTED_THAI_FONT_PATH = _find_thai_font_path()
+        if _SELECTED_THAI_FONT_PATH:
+            try:
+                print(f"[font] ใช้ฟอนต์ไทย: {_SELECTED_THAI_FONT_PATH}")
+            except Exception:
+                pass
+
+    if _SELECTED_THAI_FONT_PATH:
+        try:
+            font = ImageFont.truetype(_SELECTED_THAI_FONT_PATH, font_size)
+        except Exception:
+            font = ImageFont.load_default()
+    else:
+        font = ImageFont.load_default()
+
+    rgb_color = (color[2], color[1], color[0])
+    draw.text(position, text, font=font, fill=rgb_color)
+
+    img[:] = cv2.cvtColor(array(img_pil), cv2.COLOR_RGB2BGR)
+
+
+def init_gesture_model():
+    global _gesture_model, _gesture_label_map
+    if _gesture_model is not None:
+        return
+
+    if not os.path.exists(MODEL_PATH):
+        print(f"[model] ไม่พบไฟล์โมเดล: {MODEL_PATH}. จะใช้การเดลเยติกพื้นฐานแทน")
+        return
+
+    try:
+        with open(MODEL_PATH, 'rb') as f:
+            data = pickle.load(f)
+            _gesture_model = data.get('model')
+            _gesture_label_map = data.get('labels_dict') or data.get('label_map')
+            if _gesture_label_map is None:
+                print('[model] warning: no label map found in model file')
+            else:
+                print(f"[model] โหลดโมเดลสำเร็จ: {MODEL_PATH} ({len(_gesture_label_map)} labels)")
+    except Exception as e:
+        print(f"[model] ไม่สามารถโหลดโมเดลได้: {e}")
+        _gesture_model = None
+        _gesture_label_map = None
+
+
+def hand_landmarks_to_vector(landmarks):
+    if landmarks is None or len(landmarks) != 21:
+        return None
+
+    xs = [lm.x for lm in landmarks]
+    ys = [lm.y for lm in landmarks]
+    min_x = min(xs)
+    min_y = min(ys)
+
+    vec = []
+    for lm in landmarks:
+        vec.append(lm.x - min_x)
+        vec.append(lm.y - min_y)
+
+    return np.array(vec, dtype=np.float32).reshape(1, -1)
+
+
+def classify_gesture_model(hand_landmarks):
+    if _gesture_model is None or _gesture_label_map is None:
+        return None
+
+    vec = hand_landmarks_to_vector(hand_landmarks)
+    if vec is None:
+        return None
+
+    try:
+        idx = _gesture_model.predict(vec)[0]
+        label = _gesture_label_map.get(idx, None)
+        if label is None:
+            # Assuming labels are numeric class names if mapping absent
+            label = chr(ord('A') + int(idx)) if isinstance(idx, (int, np.integer)) else str(idx)
+
+        # Map model label to active alphabet language when appropriate
+        if UI_LANGUAGE == 'TH':
+            if isinstance(label, str) and label.upper() in ENGLISH_ALPHABET:
+                th_index = ENGLISH_ALPHABET.index(label.upper())
+                if th_index < len(THAI_ALPHABET):
+                    return THAI_ALPHABET[th_index]
+        else:
+            if isinstance(label, str) and label in THAI_ALPHABET:
+                en_index = THAI_ALPHABET.index(label)
+                if en_index < len(ENGLISH_ALPHABET):
+                    return ENGLISH_ALPHABET[en_index]
+
+        return str(label)
+    except Exception as e:
+        print(f"[model] ไม่สามารถพยากรณ์ได้: {e}")
+        return None
+
+
+# Thai alphabet ก-ฮ (44 consonants)
+THAI_ALPHABET = [
+    'ก', 'ข', 'ค', 'ง', 'จ', 'ฉ', 'ช', 'ซ', 'ฌ', 'ญ',  # 0-9
+    'ด', 'ต', 'ถ', 'ท', 'ธ', 'น', 'บ', 'ป', 'ผ', 'พ',  # 10-19
+    'ฟ', 'ภ', 'ม', 'ย', 'ร', 'ล', 'ว', 'ศ', 'ษ', 'ส',  # 20-29
+    'ห', 'ฮ'                                              # 30-31
+]
+ENGLISH_ALPHABET = [chr(ord('A') + i) for i in range(26)]
+
+# Active alphabet list for gesture mapping (sync with UI_LANGUAGE)
+ACTIVE_ALPHABET = THAI_ALPHABET
+
+
+def update_active_alphabet():
+    global ACTIVE_ALPHABET
+    if UI_LANGUAGE == 'TH':
+        ACTIVE_ALPHABET = THAI_ALPHABET
+    else:
+        ACTIVE_ALPHABET = ENGLISH_ALPHABET
+
+
+def classify_gesture(hand_landmarks):
+    """Classify hand gesture to Thai letters (ก-ฮ) and basic gestures.
+
+    Maps different hand positions to Thai letters based on finger positions.
+    """
+
+    def _is_finger_extended(tip_id: int, pip_id: int, mcp_id: int) -> bool:
+        """Return True if the finger is extended (not curled) using 3-point geometry."""
+        try:
+            import numpy as np
+        except ImportError:
+            # Fallback to simple y-comparison if numpy is not available
+            return hand_landmarks[tip_id].y < hand_landmarks[pip_id].y
+
+        tip = hand_landmarks[tip_id]
+        pip = hand_landmarks[pip_id]
+        mcp = hand_landmarks[mcp_id]
+
+        v1 = np.array([tip.x - pip.x, tip.y - pip.y, tip.z - pip.z])
+        v2 = np.array([pip.x - mcp.x, pip.y - mcp.y, pip.z - mcp.z])
+        norm1 = np.linalg.norm(v1)
+        norm2 = np.linalg.norm(v2)
+        if norm1 == 0 or norm2 == 0:
+            return False
+
+        cos_angle = np.dot(v1, v2) / (norm1 * norm2)
+        # Consider the finger extended if the joints are roughly aligned (angle < 90°).
+        return cos_angle > 0.0
+
+    fingers_extended = []
+    # Thumb: detect extension by checking whether the thumb tip is farther from the wrist than the thumb MCP.
+    wrist = hand_landmarks[0]
+    thumb_tip = hand_landmarks[4]
+    thumb_mcp = hand_landmarks[2]
+    thumb_extended = (
+        (thumb_tip.x - wrist.x) ** 2 + (thumb_tip.y - wrist.y) ** 2 + (thumb_tip.z - wrist.z) ** 2
+        >
+        (thumb_mcp.x - wrist.x) ** 2 + (thumb_mcp.y - wrist.y) ** 2 + (thumb_mcp.z - wrist.z) ** 2
+    )
+
+    # Index, middle, ring, pinky
+    finger_info = [
+        (8, 6, 5),   # index
+        (12, 10, 9),  # middle
+        (16, 14, 13),  # ring
+        (20, 18, 17),  # pinky
+    ]
+
+    for tip_id, pip_id, mcp_id in finger_info:
+        fingers_extended.append(_is_finger_extended(tip_id, pip_id, mcp_id))
+
+    num_extended = sum(fingers_extended)
+    
+    # Map finger patterns to active alphabet (ไทย/อังกฤษ)
+    # Index + middle extended (V sign) = @0
+    if fingers_extended[0] and fingers_extended[1] and not fingers_extended[2] and not fingers_extended[3]:
+        return ACTIVE_ALPHABET[0]
+    # Only index extended = @1
+    elif fingers_extended[0] and not any(fingers_extended[1:]):
+        if len(ACTIVE_ALPHABET) > 1:
+            return ACTIVE_ALPHABET[1]
+    # Index + middle + ring extended = @2
+    elif fingers_extended[0] and fingers_extended[1] and fingers_extended[2] and not fingers_extended[3]:
+        if len(ACTIVE_ALPHABET) > 2:
+            return ACTIVE_ALPHABET[2]
+    # All fingers extended (without thumb) = @3
+    elif all(fingers_extended) and not thumb_extended:
+        if len(ACTIVE_ALPHABET) > 3:
+            return ACTIVE_ALPHABET[3]
+    # All fingers extended = @0 (fallback)
+    elif all(fingers_extended) and thumb_extended:
+        return ACTIVE_ALPHABET[0]
+    # Only middle extended = @4
+    elif fingers_extended[1] and not any([fingers_extended[0], fingers_extended[2], fingers_extended[3]]):
+        if len(ACTIVE_ALPHABET) > 4:
+            return ACTIVE_ALPHABET[4]
+    # Index + middle + ring extended = @5
+    elif fingers_extended[0] and fingers_extended[1] and fingers_extended[2] and not fingers_extended[3]:
+        if len(ACTIVE_ALPHABET) > 5:
+            return ACTIVE_ALPHABET[5]
+    # Only ring extended = @6
+    elif fingers_extended[2] and not any([fingers_extended[0], fingers_extended[1], fingers_extended[3]]):
+        if len(ACTIVE_ALPHABET) > 6:
+            return ACTIVE_ALPHABET[6]
+    # Only pinky extended = @7
+    elif fingers_extended[3] and not any(fingers_extended[:-1]):
+        if len(ACTIVE_ALPHABET) > 7:
+            return ACTIVE_ALPHABET[7]
+    # Index + pinky extended = @8
+    elif fingers_extended[0] and fingers_extended[3] and not fingers_extended[1] and not fingers_extended[2]:
+        if len(ACTIVE_ALPHABET) > 8:
+            return ACTIVE_ALPHABET[8]
+    # Thumb extended only = @9
+    elif thumb_extended and not any(fingers_extended):
+        if len(ACTIVE_ALPHABET) > 9:
+            return ACTIVE_ALPHABET[9]
+    # No fingers extended + fist = @10
+    elif not any(fingers_extended) and not thumb_extended:
+        if len(ACTIVE_ALPHABET) > 10:
+            return ACTIVE_ALPHABET[10]
+    # Two fingers (middle + ring) = @11
+    elif not fingers_extended[0] and fingers_extended[1] and fingers_extended[2] and not fingers_extended[3]:
+        if len(ACTIVE_ALPHABET) > 11:
+            return ACTIVE_ALPHABET[11]
+    # Three fingers (index, ring, pinky) = @12
+    elif fingers_extended[0] and not fingers_extended[1] and fingers_extended[2] and fingers_extended[3]:
+        if len(ACTIVE_ALPHABET) > 12:
+            return ACTIVE_ALPHABET[12]
+    # Middle + pinky = @13
+    elif not fingers_extended[0] and fingers_extended[1] and not fingers_extended[2] and fingers_extended[3]:
+        if len(ACTIVE_ALPHABET) > 13:
+            return ACTIVE_ALPHABET[13]
+    
+    # Default patterns for remaining letters (32 variations are possible with 5 digits)
+    # Calculate a pattern index for remaining letters
+    pattern_index = num_extended + (1 if thumb_extended else 0)
+    
+    # Cycle through remaining alphabet if pattern repeats
+    if pattern_index < len(ACTIVE_ALPHABET):
+        return ACTIVE_ALPHABET[pattern_index % len(ACTIVE_ALPHABET)]
+    
+    return "?"  # Unknown gesture
+
+
+# Template pose for the word "บ้านลับ" (used by pose matching).
+_BANMAI_TEMPLATE: Optional[list] = None
+
+
+def _normalize_landmarks(landmarks):
+    """Normalize landmarks (relative position + scale) for pose matching."""
+    if not landmarks:
+        return []
+
+    # Use wrist (landmark 0) as origin.
+    origin = landmarks[0]
+    coords = [(lm.x - origin.x, lm.y - origin.y, lm.z - origin.z) for lm in landmarks]
+
+    max_dist = max(((x * x + y * y + z * z) ** 0.5 for x, y, z in coords), default=1.0)
+    if max_dist <= 0:
+        max_dist = 1.0
+
+    return [(x / max_dist, y / max_dist, z / max_dist) for x, y, z in coords]
+
+
+def _landmark_distance(a, b):
+    """Mean Euclidean distance between two normalized landmark sets."""
+    if not a or not b or len(a) != len(b):
+        return float('inf')
+
+    total = 0.0
+    for (ax, ay, az), (bx, by, bz) in zip(a, b):
+        dx = ax - bx
+        dy = ay - by
+        dz = az - bz
+        total += (dx * dx + dy * dy + dz * dz) ** 0.5
+
+    return total / len(a)
+
+
+def is_banmai_pose(hand_landmarks, threshold: float = 0.12):
+    """Return True when the current hand pose matches the stored 'บ้านใหม่' template."""
+    global _BANMAI_TEMPLATE
+    if _BANMAI_TEMPLATE is None:
+        return False
+
+    norm = _normalize_landmarks(hand_landmarks)
+    dist = _landmark_distance(norm, _BANMAI_TEMPLATE)
+    return dist < threshold
+
+
+def save_banmai_template(hand_landmarks):
+    """Store the current hand pose as the 'บ้านใหม่' template."""
+    global _BANMAI_TEMPLATE
+    _BANMAI_TEMPLATE = _normalize_landmarks(hand_landmarks)
+    return _BANMAI_TEMPLATE is not None
+
+
+def clear_banmai_template():
+    """Clear any stored 'บ้านใหม่' pose template."""
+    global _BANMAI_TEMPLATE
+    _BANMAI_TEMPLATE = None
+
+
+DEFAULT_TASK_MODEL_URL = 'https://storage.googleapis.com/mediapipe-assets/hand_landmarker.task'
+
+
+def download_model(url: str) -> str:
+    fd, path = tempfile.mkstemp(suffix='.task')
+    os.close(fd)
+    try:
+        urllib.request.urlretrieve(url, path)
+        return path
+    except Exception:
+        if os.path.exists(path):
+            os.remove(path)
+        raise
+
+
+def open_capture(camera_index: int = 0, video_path: Optional[str] = None):
+    """Open a video capture from a webcam or a video file.
+
+    On Windows, using CAP_DSHOW often improves camera access.
+    """
+
+    if video_path:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"Cannot open video file: {video_path}")
+        return cap
+
+    for idx in range(camera_index, camera_index + 3):
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            print(f"Using camera index {idx}")
+            return cap
+        cap.release()
+    print(f"Cannot open any camera (tried indexes {camera_index}-{camera_index+2})")
+    return cv2.VideoCapture(camera_index)
+
+
+def run_with_solutions(cap, max_num_hands: int, min_detection_confidence: float):
+    import mediapipe as mp
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+
+    with mp_hands.Hands(
+        max_num_hands=max_num_hands,
+        min_detection_confidence=min_detection_confidence,
+        min_tracking_confidence=0.5,
+    ) as hands:
+        prev_time = 0
+        recognized_words = []
+        recorded_letters = []  # Store recorded letters for 'r' and 't' feature
+        current_word = None
+        last_landmarks = None
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to read frame from camera. Exiting.")
+                break
+
+            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image.flags.writeable = False
+            results = hands.process(image)
+
+            image.flags.writeable = True
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+            current_word = None
+            last_landmarks = None
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    mp_drawing.draw_landmarks(
+                        image,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                        mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2),
+                    )
+                    last_landmarks = hand_landmarks.landmark
+                    gesture = classify_gesture_model(last_landmarks) or classify_gesture(last_landmarks)
+                    if is_banmai_pose(last_landmarks):
+                        current_word = "สวัสดี"
+                    else:
+                        current_word = gesture
+
+            if current_word:
+                if not recognized_words or recognized_words[-1] != current_word:
+                    recognized_words.append(current_word)
+
+            # Display current gesture detected
+            if current_word:
+                _draw_unicode_text(image, current_word, (10, 60), font_size=30, color=(0, 255, 0))
+
+            # Display recorded letters (from 'r' key)
+            recorded_text = ''.join(recorded_letters)
+            if recorded_text:
+                _draw_unicode_text(image, f"บันทึก: {recorded_text}", (10, 120), font_size=26, color=(255, 0, 0))
+
+            # Show whether the 'บ้านลับ' pose template is set
+            template_status = "เซฟแล้ว" if _BANMAI_TEMPLATE else "ยังไม่เซฟ"
+            _draw_unicode_text(image, f"{get_ui_text('template_status')}: {template_status}", (10, 160), font_size=22, color=(255, 255, 0))
+
+            #UI Help text
+            _draw_unicode_text(image, get_ui_text('help'), (10, 200), font_size=18, color=(255, 255, 255))
+
+            #FPS
+            curr_time = time.time()
+            fps = 1 / (curr_time - prev_time) if prev_time else 0.0
+            prev_time = curr_time
+            cv2.putText(image, f"FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+
+            cv2.imshow('Hand Detection (press q to quit)', image)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:
+                break
+            elif key == ord('a'):
+                toggle_language()
+            elif key == ord('b'):  # Save current pose as "บ้านลับ"
+                if last_landmarks:
+                    if save_banmai_template(last_landmarks):
+                        print(get_ui_text('saved'))
+                    else:
+                        print(get_ui_text('saved_fail'))
+                else:
+                    print(get_ui_text('no_hand'))
+            elif key == ord('c'):  # Clear saved template
+                clear_banmai_template()
+                print(get_ui_text('reset_template'))
+            elif key == ord('r'):  # Record current gesture
+                if current_word and current_word != '?':
+                    recorded_letters.append(current_word)
+                    print(f"บันทึก: {current_word} | รวม: {''.join(recorded_letters)}")
+            elif key == ord('e'):  # Remove last recorded letter
+                if recorded_letters:
+                    removed = recorded_letters.pop()
+                    print(f"ลบ: {removed} | เหลือ: {''.join(recorded_letters)}")
+                else:
+                    print("ไม่มีตัวอักษรให้ลบ")
+            elif key == ord('t'):  # Finish and output
+                if recorded_letters:
+                    result_text = ''.join(recorded_letters)
+                    print(f"\n✓ ผลลัพธ์: {result_text}\n")
+                    recorded_letters = []
+            elif key == ord('p'):
+                print('Recognized words:', recognized_words)
+
+
+def run_with_tasks(cap, model_path: str, max_num_hands: int, min_detection_confidence: float):
+    import mediapipe as mp
+    # import task modules
+    from mediapipe.tasks.python.vision import hand_landmarker as hl_module
+    from mediapipe.tasks.python.core.base_options import BaseOptions
+    from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
+    from mediapipe.tasks.python.vision.core import vision_task_running_mode as vrm
+
+    base_options = BaseOptions(model_asset_path=model_path)
+    running_mode = getattr(vrm.VisionTaskRunningMode, 'VIDEO', vrm.VisionTaskRunningMode.IMAGE)
+    options = HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=running_mode,
+        num_hands=max_num_hands,
+        min_hand_detection_confidence=min_detection_confidence,
+        min_tracking_confidence=0.5,
+    )
+
+    landmarker = HandLandmarker.create_from_options(options)
+
+    prev_time = 0
+    recognized_words = []
+    recorded_letters = []  # Store recorded letters for 'r' and 't' feature
+    current_word = None
+    last_landmarks = None
+    
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to read frame from camera. Exiting.")
+                break
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            mp_image = mp.Image(mp.ImageFormat.SRGB, rgb)
+            timestamp_ms = int(time.time() * 1000)
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+            image_out = frame.copy()
+            h, w, _ = image_out.shape
+
+            current_word = None
+            last_landmarks = None
+            if result and getattr(result, 'hand_landmarks', None):
+                for hand_landmarks in result.hand_landmarks:
+                    pts = []
+                    for lm in hand_landmarks:
+                        x = int(lm.x * w)
+                        y = int(lm.y * h)
+                        pts.append((x, y))
+                        cv2.circle(image_out, (x, y), 3, (0, 255, 0), -1)
+
+                    last_landmarks = hand_landmarks
+                    gesture = classify_gesture_model(hand_landmarks) or classify_gesture(hand_landmarks)
+                    if is_banmai_pose(hand_landmarks):
+                        current_word = "สวัสดี"
+                    else:
+                        current_word = gesture
+
+                    try:
+                        connections = hl_module.HandLandmarksConnections.HAND_CONNECTIONS
+                        for conn in connections:
+                            start = (int(hand_landmarks[conn.start].x * w), int(hand_landmarks[conn.start].y * h))
+                            end = (int(hand_landmarks[conn.end].x * w), int(hand_landmarks[conn.end].y * h))
+                            cv2.line(image_out, start, end, (0, 255, 255), 2)
+                    except Exception:
+                        pass
+
+            if current_word:
+                if not recognized_words or recognized_words[-1] != current_word:
+                    recognized_words.append(current_word)
+
+            # Display current gesture detected
+            if current_word:
+                _draw_unicode_text(image_out, current_word, (10, 60), font_size=30, color=(0, 255, 0))
+
+            # Display recorded letters (from 'r' key)
+            recorded_text = ''.join(recorded_letters)
+            if recorded_text:
+                _draw_unicode_text(image_out, f"บันทึก: {recorded_text}", (10, 120), font_size=26, color=(255, 0, 0))
+
+            # Show whether the 'บ้านลับ' pose template is set
+            template_status = "เซฟแล้ว" if _BANMAI_TEMPLATE else "ยังไม่เซฟ"
+            _draw_unicode_text(image_out, f"{get_ui_text('template_status')}: {template_status}", (10, 160), font_size=22, color=(255, 255, 0))
+            _draw_unicode_text(image_out, get_ui_text('help'), (10, 200), font_size=18, color=(255, 255, 255))
+
+            curr_time = time.time()
+            fps = 1 / (curr_time - prev_time) if prev_time else 0.0
+            prev_time = curr_time
+            cv2.putText(image_out, f"FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+
+            cv2.imshow('Hand Detection (press q to quit)', image_out)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:
+                break
+            elif key == ord('a'):
+                toggle_language()
+            elif key == ord('b'):  # Save current pose as "ลับ"
+                if last_landmarks:
+                    if save_banmai_template(last_landmarks):
+                        print(get_ui_text('saved'))
+                    else:
+                        print(get_ui_text('saved_fail'))
+                else:
+                    print(get_ui_text('no_hand'))
+            elif key == ord('c'):  # Clear saved template
+                clear_banmai_template()
+                print(get_ui_text('reset_template'))
+            elif key == ord('r'):  # Record current gesture
+                if current_word and current_word != '?':
+                    recorded_letters.append(current_word)
+                    print(f"บันทึก: {current_word} | รวม: {''.join(recorded_letters)}")
+            elif key == ord('e'):  # Remove last recorded letter
+                if recorded_letters:
+                    removed = recorded_letters.pop()
+                    print(f"ลบ: {removed} | เหลือ: {''.join(recorded_letters)}")
+                else:
+                    print("ไม่มีตัวอักษรให้ลบ")
+            elif key == ord('t'):  # Finish and output
+                if recorded_letters:
+                    result_text = ''.join(recorded_letters)
+                    print(f"\n✓ ผลลัพธ์: {result_text}\n")
+                    recorded_letters = []
+            elif key == ord('p'):
+                print('Recognized words:', recognized_words)
+    finally:
+        landmarker.close()
+
+
+def _list_image_files(dir_path: str):
+    """Return a sorted list of supported image paths from a directory."""
+
+    extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+    if not os.path.isdir(dir_path):
+        return []
+
+    return sorted(
+        os.path.join(dir_path, f)
+        for f in os.listdir(dir_path)
+        if f.lower().endswith(extensions)
+    )
+
+
+def _read_image(path: str):
+    """Read an image from disk in a way that supports unicode paths (Windows)."""
+
+    image = cv2.imread(path)
+    if image is not None:
+        return image
+
+    try:
+        from PIL import Image
+        import numpy as np
+
+        with Image.open(path) as pil_img:
+            pil_img = pil_img.convert('RGB')
+            rgb = np.array(pil_img)
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception:
+        return None
+
+
+def run_on_images(dir_path: str, max_num_hands: int, min_detection_confidence: float, model: Optional[str] = None):
+    """Run gesture recognition on all images in a directory.
+
+    Images are matched against an expected label derived from the filename (without extension).
+    """
+
+    if not os.path.isdir(dir_path):
+        try:
+            os.makedirs(dir_path, exist_ok=True)
+            print(f"สร้างโฟลเดอร์ใหม่สำหรับรูปภาพ: {dir_path}")
+            print("กรุณาวางไฟล์รูป (jpg/png/...) ลงในโฟลเดอร์นี้ แล้วเรียกสคริปต์อีกครั้ง")
+        except Exception as e:
+            print(f"ไม่สามารถสร้างโฟลเดอร์: {dir_path} ({e})")
+        return
+
+    # Collect supported image files
+    paths = _list_image_files(dir_path)
+
+    if not paths:
+        print(f"ไม่พบไฟล์ภาพในโฟลเดอร์: {dir_path}")
+        return
+
+    output_dir = os.path.join(dir_path, 'out')
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Choose which MediaPipe API is available
+    use_solutions = False
+    try:
+        import mediapipe as mp
+        use_solutions = hasattr(mp, 'solutions')
+    except Exception:
+        use_solutions = False
+
+    if not use_solutions and model is None:
+        model = download_model(DEFAULT_TASK_MODEL_URL)
+        print('No MediaPipe solutions API found; downloaded default task model to', model)
+
+    correct = 0
+    total = 0
+
+    for path in paths:
+        total += 1
+        image = _read_image(path)
+        if image is None:
+            print(f"ไม่สามารถอ่านรูป: {path}")
+            continue
+
+        predicted = None
+        if use_solutions:
+            try:
+                import mediapipe as mp
+                mp_hands = mp.solutions.hands
+                with mp_hands.Hands(
+                    max_num_hands=max_num_hands,
+                    min_detection_confidence=min_detection_confidence,
+                    min_tracking_confidence=0.5,
+                ) as hands:
+                    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    rgb.flags.writeable = False
+                    res = hands.process(rgb)
+                    if res and getattr(res, 'multi_hand_landmarks', None):
+                        predicted = classify_gesture(res.multi_hand_landmarks[0].landmark)
+            except Exception as e:
+                print('Error running MediaPipe solutions on', path, ':', e)
+        else:
+            try:
+                import mediapipe as mp
+                from mediapipe.tasks.python.vision import hand_landmarker as hl_module
+                from mediapipe.tasks.python.core.base_options import BaseOptions
+                from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
+
+                base_options = BaseOptions(model_asset_path=model)
+                options = HandLandmarkerOptions(
+                    base_options=base_options,
+                    num_hands=max_num_hands,
+                    min_hand_detection_confidence=min_detection_confidence,
+                    min_tracking_confidence=0.5,
+                )
+
+                landmarker = HandLandmarker.create_from_options(options)
+                try:
+                    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    mp_image = mp.Image(mp.ImageFormat.SRGB, rgb)
+                    if hasattr(landmarker, 'detect'):
+                        result = landmarker.detect(mp_image)
+                    else:
+                        result = landmarker.detect_for_video(mp_image, 0)
+                    if result and getattr(result, 'hand_landmarks', None):
+                        predicted = classify_gesture(result.hand_landmarks[0])
+                finally:
+                    landmarker.close()
+            except Exception as e:
+                print('Error running MediaPipe tasks on', path, ':', e)
+
+        expected = os.path.splitext(os.path.basename(path))[0]
+        ok = predicted == expected
+        if ok:
+            correct += 1
+
+        label = f"predicted: {predicted or '---'} | expected: {expected} {'✓' if ok else '✗'}"
+        print(f"{os.path.basename(path)} -> {label}")
+
+        try:
+            overlay = image.copy()
+            cv2.putText(overlay, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            out_path = os.path.join(output_dir, os.path.basename(path))
+            cv2.imwrite(out_path, overlay)
+        except Exception as e:
+            print(f"ไม่สามารถบันทึกภาพผลลัพธ์ได้: {e}")
+
+    print(f"\nสรุป: ถูก {correct}/{total} ({correct/total*100:.1f}% )")
+    print(f"บันทึกภาพผลลัพธ์ไว้ที่: {output_dir}")
+
+
+def main(camera_index: int = 0, video_path: Optional[str] = None, max_num_hands: int = 2, min_detection_confidence: float = 0.5, model: Optional[str] = None, pic_dir: Optional[str] = None):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+    if not _PIL_AVAILABLE:
+        print('คำเตือน: Pillow ยังไม่ติดตั้ง; ข้อความไทยอาจแสดงเป็น ???? (ติดตั้งด้วย pip install pillow)')
+
+    init_gesture_model()
+
+    if pic_dir is not None:
+        run_on_images(pic_dir, max_num_hands, min_detection_confidence, model=model)
+        return
+
+    cap = open_capture(camera_index, video_path=video_path)
+    if not cap.isOpened():
+        print("Failed to open camera or video source. Make sure a webcam is connected or provide a valid --video file.")
+        return
+
+    try:
+        import mediapipe as mp
+        if hasattr(mp, 'solutions'):
+            run_with_solutions(cap, max_num_hands, min_detection_confidence)
+            cap.release()
+            cv2.destroyAllWindows()
+            return
+    except Exception:
+        pass
+
+    try:
+        import mediapipe as mp
+        model_path = model
+        if not model_path:
+            print('No task model provided; downloading default model...')
+            model_path = download_model(DEFAULT_TASK_MODEL_URL)
+            print('Downloaded model to', model_path)
+
+        run_with_tasks(cap, model_path, max_num_hands, min_detection_confidence)
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+def test_mode(max_num_hands: int = 2, min_detection_confidence: float = 0.5, model: Optional[str] = None):
+    """Run a headless check to detect which MediaPipe API is available and exercise it without camera."""
+    import numpy as np
+    print('Running headless test...')
+    try:
+        import mediapipe as mp
+        print('mediapipe module:', getattr(mp, '__file__', 'builtin'))
+        if hasattr(mp, 'solutions'):
+            print('Using mp.solutions (Hands)')
+            try:
+                mp_hands = mp.solutions.hands
+                with mp_hands.Hands(
+                    max_num_hands=max_num_hands,
+                    min_detection_confidence=min_detection_confidence,
+                    min_tracking_confidence=0.5,
+                ) as hands:
+                    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+                    img = cv2.cvtColor(dummy, cv2.COLOR_BGR2RGB)
+                    img.flags.writeable = False
+                    res = hands.process(img)
+                    print('mp.solutions.Hands.process() returned:', bool(res and getattr(res, 'multi_hand_landmarks', None)))
+            except Exception as e:
+                print('Error exercising mp.solutions.Hands:', e)
+        elif hasattr(mp, 'tasks'):
+            print('mp.solutions not present; mediapipe.tasks detected')
+            try:
+                from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
+                print('HandLandmarker class available; creating instance requires a .task model file (not attempted in --test)')
+            except Exception as e:
+                print('Error inspecting mediapipe.tasks APIs:', e)
+        else:
+            print('mediapipe installed but no recognizable API found (neither solutions nor tasks)')
+    except Exception as e:
+        print('mediapipe import failed:', e)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Hand detection with MediaPipe (solutions or tasks) and OpenCV')
+    parser.add_argument('--camera', '-c', type=int, default=0, help='Camera index (default: 0)')
+    parser.add_argument('--video', type=str, default=None, help='Path to a video file (optional)')
+    parser.add_argument('--max-hands', type=int, default=2, help='Maximum number of hands to detect')
+    parser.add_argument('--min-detect-confidence', type=float, default=0.5, help='Min detection confidence')
+    parser.add_argument('--model', type=str, default=None, help='Path to .task model for mediapipe tasks (optional)')
+    parser.add_argument('--pic-dir', type=str, default=None, help='Path to folder containing images for training/evaluation (e.g., pic/)')
+    parser.add_argument('--test', action='store_true', help='Run headless test (no camera)')
+    args = parser.parse_args()
+
+    if args.test:
+        test_mode(max_num_hands=args.max_hands, min_detection_confidence=args.min_detect_confidence, model=args.model)
+    else:
+        main(
+            camera_index=args.camera,
+            video_path=args.video,
+            max_num_hands=args.max_hands,
+            min_detection_confidence=args.min_detect_confidence,
+            model=args.model,
+            pic_dir=args.pic_dir,
+        )

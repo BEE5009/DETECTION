@@ -1,0 +1,15 @@
+﻿.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite
+*.mp4
+*.mov
+*.avi
+*.wav
+*.pickle
+*.pkl
+.DS_Store
+Thumbs.db
